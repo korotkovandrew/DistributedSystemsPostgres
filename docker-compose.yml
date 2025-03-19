@@ -1,0 +1,90 @@
+services:
+  postgres_primary:
+    image: postgres:15.0
+    container_name: postgres_primary
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgresadmin
+      - POSTGRES_PASSWORD=admin123
+      - POSTGRES_DB=university
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - primary_data:/var/lib/postgresql/data
+      - ./10-init.sql:/docker-entrypoint-initdb.d/10-init.sql
+      - ./20-setup-pg-hba.sh:/docker-entrypoint-initdb.d/20-setup-pg-hba.sh
+      - ./pg_hba.conf:/tmp/pg_hba.conf
+    networks:
+      - postgres_network
+    command: >
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c wal_keep_size=32MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgresadmin -d university"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres_replica:
+    image: postgres:15.0
+    container_name: postgres_replica
+    ports:
+      - "5433:5432"
+    environment:
+      - PGUSER=replicator
+      - PGPASSWORD=replicator_password
+      - POSTGRES_USER=postgresadmin
+      - POSTGRES_PASSWORD=admin123
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - replica_data:/var/lib/postgresql/data
+    networks:
+      - postgres_network
+    depends_on:
+      - postgres_primary
+    command: >
+      bash -c "
+        until PGPASSWORD=admin123 pg_isready -h postgres_primary -p 5432 -U postgresadmin -d university; do
+          echo 'Waiting for primary to be ready...';
+          sleep 1;
+        done;
+        if [ ! -f /var/lib/postgresql/data/pgdata/standby.signal ]; then
+          echo 'Initializing replica...';
+          rm -rf /var/lib/postgresql/data/pgdata/*;
+          pg_basebackup -h postgres_primary -p 5432 -U replicator -D /var/lib/postgresql/data/pgdata -Fp -Xs -P -R;
+          chown -R postgres:postgres /var/lib/postgresql/data/pgdata;
+          chmod 0700 /var/lib/postgresql/data/pgdata;
+        fi;
+        echo 'Starting replica...';
+        exec gosu postgres postgres
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgresadmin -d university"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: flask_server
+    ports:
+      - "5000:5000"
+    networks:
+      - postgres_network
+    depends_on:
+      - postgres_primary
+      - postgres_replica
+    environment:
+      - FLASK_ENV=development
+
+volumes:
+  primary_data:
+  replica_data:
+
+networks:
+  postgres_network:
+    driver: bridge
